@@ -62,8 +62,15 @@
 
 <div id="status">جاري الاتصال...</div>
 
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
+// لو الصفحة مفتوحة جوا تيليغرام (كـ Mini App)، وسّعها لتاخذ كامل الشاشة
+if (window.Telegram && window.Telegram.WebApp) {
+  Telegram.WebApp.ready();
+  Telegram.WebApp.expand();
+}
+
 const params = new URLSearchParams(window.location.search);
 const roomCode = params.get("room") || "public";
 document.title = "مشاهدة مع بعض - " + roomCode;
