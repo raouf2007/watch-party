@@ -3,15 +3,24 @@
 يستخدم نفس أكواد الغرف اللي يستخدمها بوت تيليغرام (مجلد telegram_group_bot)
 """
 
+import base64
+import os
 import time
 import uuid
 from typing import Dict
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
+import moderation
+
 app = FastAPI()
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID = os.environ.get("ADMIN_ID", "")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # حالة كل غرفة: الفيديو الحالي، هل شغال أو لأ، والوقت الحالي بالثواني
 room_state: Dict[str, dict] = {}
@@ -30,6 +39,60 @@ async def index():
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+async def tg_send_message(text: str):
+    """يرسل نص للمشرف مباشرة عبر Telegram Bot API"""
+    if not BOT_TOKEN or not ADMIN_ID:
+        print(f"[DEBUG] BOT_TOKEN أو ADMIN_ID غير مضبوطين. BOT_TOKEN موجود: {bool(BOT_TOKEN)}, ADMIN_ID: {ADMIN_ID!r}")
+        return
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={"chat_id": ADMIN_ID, "text": text},
+            )
+            print(f"[DEBUG] sendMessage status={resp.status_code} body={resp.text[:300]}")
+        except Exception as e:
+            print(f"[DEBUG] فشل sendMessage: {e}")
+
+
+async def tg_send_photo(caption: str, data_url: str):
+    if not BOT_TOKEN or not ADMIN_ID:
+        return
+    try:
+        _, encoded = data_url.split(",", 1)
+        photo_bytes = base64.b64decode(encoded)
+    except Exception:
+        return
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            await client.post(
+                f"{TELEGRAM_API}/sendPhoto",
+                data={"chat_id": ADMIN_ID, "caption": caption},
+                files={"photo": ("image.jpg", photo_bytes, "image/jpeg")},
+            )
+        except Exception:
+            pass
+
+
+async def tg_send_voice_copy(caption: str, data_url: str):
+    if not BOT_TOKEN or not ADMIN_ID:
+        return
+    try:
+        _, encoded = data_url.split(",", 1)
+        voice_bytes = base64.b64decode(encoded)
+    except Exception:
+        return
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            await client.post(
+                f"{TELEGRAM_API}/sendDocument",
+                data={"chat_id": ADMIN_ID, "caption": caption},
+                files={"document": ("voice.webm", voice_bytes, "audio/webm")},
+            )
+        except Exception:
+            pass
 
 
 async def broadcast(room_code: str, message: dict, exclude_id: str = None):
@@ -106,28 +169,40 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
 
             # --- الدردشة النصية ---
             elif msg_type == "chat":
-                await broadcast(room_code, {
-                    "type": "chat",
-                    "name": str(data.get("name", "مستخدم"))[:40],
-                    "text": str(data.get("text", ""))[:2000],
-                })
+                name = str(data.get("name", "مستخدم"))[:40]
+                text = str(data.get("text", ""))[:2000]
+
+                if moderation.contains_flagged_content(text):
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "🚫 هذي الرسالة تخالف قوانين الاستخدام ولن تُرسل.",
+                    })
+                    await tg_send_message(
+                        f"🚨 [موقع المشاهدة] محتوى مخالف تم حظره\n"
+                        f"الغرفة: {room_code}\nمن: {name}\n\nالنص:\n{text}"
+                    )
+                    continue
+
+                await broadcast(room_code, {"type": "chat", "name": name, "text": text})
+                await tg_send_message(
+                    f"🔎 [موقع المشاهدة] الغرفة: {room_code}\nمن: {name}\n\n{text}"
+                )
 
             # --- إرسال صورة/لقطة شاشة ---
             elif msg_type == "image":
+                name = str(data.get("name", "مستخدم"))[:40]
                 image_data = data.get("data", "")
                 if len(image_data) > MAX_IMAGE_SIZE:
                     await websocket.send_json({
                         "type": "error", "message": "الصورة كبيرة جداً، جرب صورة أصغر.",
                     })
                 else:
-                    await broadcast(room_code, {
-                        "type": "image",
-                        "name": str(data.get("name", "مستخدم"))[:40],
-                        "data": image_data,
-                    })
+                    await broadcast(room_code, {"type": "image", "name": name, "data": image_data})
+                    await tg_send_photo(f"🔎 [موقع المشاهدة] الغرفة: {room_code}\nمن: {name}", image_data)
 
             # --- إرسال رسالة صوتية ---
             elif msg_type == "voice":
+                name = str(data.get("name", "مستخدم"))[:40]
                 voice_data = data.get("data", "")
                 if len(voice_data) > MAX_VOICE_SIZE:
                     await websocket.send_json({
@@ -135,11 +210,8 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                         "message": "الرسالة الصوتية طويلة جداً، سجّل مقطع أقصر.",
                     })
                 else:
-                    await broadcast(room_code, {
-                        "type": "voice",
-                        "name": str(data.get("name", "مستخدم"))[:40],
-                        "data": voice_data,
-                    })
+                    await broadcast(room_code, {"type": "voice", "name": name, "data": voice_data})
+                    await tg_send_voice_copy(f"🔎 [موقع المشاهدة] الغرفة: {room_code}\nمن: {name}", voice_data)
 
     except WebSocketDisconnect:
         room_clients.get(room_code, {}).pop(client_id, None)
